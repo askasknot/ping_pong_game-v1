@@ -2,6 +2,13 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Encoder.h>
+#include <EEPROM.h>
+#include <avr/sleep.h>
+
+// Constants and definitions
+#define MAX_SCORES 50             // Store top 50 scores
+#define EEPROM_START_ADDR 0       // EEPROM starting address
+#define LEADERBOARD_TIMEOUT 10000 // Show leaderboard for 10 seconds
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
@@ -9,8 +16,8 @@
 #define PADDLE_HEIGHT 8
 #define SSD1306_I2C_ADDRESS 0x3C  // Common I2C address for SSD1306 displays
 #define BALL_SIZE 3
-#define BRICK_WIDTH 4
-#define BRICK_HEIGHT 4
+#define BRICK_WIDTH 5
+#define BRICK_HEIGHT 5
 #define BRICK_COUNT 5
 #define BRICK_FALL_SPEED 1
 #define GAME_OVER_Y 30
@@ -18,19 +25,25 @@
 #define BRICK_RESPAWN_X -5  // Position left of screen
 #define BUZZER_PIN 5       // Pin for piezo buzzer
 #define ENCODER_SW_PIN 4
+#define ENCODER_MIN_STEP 1
+#define ENCODER_MAX_STEP 5
+#define ENCODER_ACCELERATION 0.5
 
 // Define musical notes
 #define NOTE_C5  523
 #define NOTE_CS5 554
 #define NOTE_D5  587
 #define NOTE_DS5 622
+#define RESET_SCORES_TIME 5000  // Hold button for 5 seconds to reset
 
 // Define display object
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Encoder myEncoder(2, 3); // Using pins 2 and 3 for encoder
 
 // Game variables
-int encoderSensitivity = 1;  // Adjust sensitivity (higher value = less sensitive)
+long oldEncPosition = -999;
+bool ballStuck = false;           // Flag to track if ball is stuck to paddle
+float ballPaddleOffset = 0;       // Track ball position relative to paddle
 int paddleY = (SCREEN_HEIGHT - PADDLE_HEIGHT) / 2;
 int paddleX = 10;  // Moved 10 pixels to the right
 float ballX = SCREEN_WIDTH / 2;
@@ -40,7 +53,16 @@ unsigned long lastPaddleCollision = 0;
 float ballSpeedY = 0.5;
 int score = 0;
 unsigned long gameOverStartTime = 0;  // Track when game over started
+int highScores[MAX_SCORES] = {0};
+int currentScoreIndex = -1;      // Index of current score in highscores
+bool inLeaderboard = false;      // Leaderboard display mode
+unsigned long leaderboardStartTime = 0;
+unsigned long lastFlashTime = 0;
+bool flashState = true;
+unsigned long lastBrickCollision = 0;
+unsigned long lastFlashUpdate = 0; // For flashing the current score
 
+int scrollOffset = 0; // Added scrollOffset variable declaration
 // Multiple bricks
 int brickX[BRICK_COUNT];  
 float brickY[BRICK_COUNT];
@@ -48,17 +70,207 @@ bool brickActive[BRICK_COUNT];
 unsigned long lastMoveTime = 0;
 bool soundPlayed = false;
 bool gameOver = false;
-long oldPosition = -999;
+unsigned long buttonPressStartTime = 0; // For tracking button hold time
+
+// Function declarations
+void loadHighScores();
+void saveHighScores();
+void playWahWahSound();
+void addScore(int newScore);
+void displayLeaderboard();
+void resetGame();
+void sleepMode();
+void resetAllScores();
+
+bool checkBrickCollision(float ballX, float ballY, int ballSize, 
+                         int brickX, int brickY, int brickWidth, int brickHeight) {                        
+  // Previous position calculation (basic trajectory check)
+  float prevBallX = ballX - ballSpeedX;
+  float prevBallY = ballY - ballSpeedY;
+  
+  // Check both current position and previous-to-current path
+  // This catches fast-moving balls that might "teleport" through objects
+  if ((ballX + ballSize >= brickX && ballX <= brickX + brickWidth &&
+       ballY + ballSize >= brickY && ballY <= brickY + brickHeight) ||
+      (lineRectIntersection(prevBallX, prevBallY, ballX, ballY, brickX, brickY, brickWidth, brickHeight))) {
+    return true;
+  }
+  
+  // Extra check for fast angular movement - check all four corners of the ball
+  for (int cx = 0; cx <= 1; cx++) {
+    for (int cy = 0; cy <= 1; cy++) {
+      if (lineRectIntersection(prevBallX + cx*ballSize, prevBallY + cy*ballSize, 
+                              ballX + cx*ballSize, ballY + cy*ballSize,
+                              brickX, brickY, brickWidth, brickHeight)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void handleBrickCollision(float &ballX, float &ballY, float &ballSpeedX, float &ballSpeedY,
+                          int brickX, int brickY, int brickWidth, int brickHeight, int ballSize) {
+  // Determine which side of the brick was hit
+  float overlapX = min(ballX + ballSize - brickX, brickX + brickWidth - ballX);
+  float overlapY = min(ballY + ballSize - brickY, brickY + brickHeight - ballY);
+  
+  // Calculate ball center point
+  float ballCenterX = ballX + ballSize/2;
+  float ballCenterY = ballY + ballSize/2;
+  float brickCenterX = brickX + brickWidth/2;
+  float brickCenterY = brickY + brickHeight/2;
+
+  // Improved bounce direction detection
+  if ((ballCenterX < brickCenterX && ballSpeedX > 0) || 
+      (ballCenterX > brickCenterX && ballSpeedX < 0)) {
+    ballSpeedX = -ballSpeedX;
+  } else { // Otherwise reverse Y
+    ballSpeedY = -ballSpeedY;
+  }
+  
+  // Prevent sticking by moving ball slightly away from brick
+  ballX += ballSpeedX * 1.5;
+  ballY += ballSpeedY * 1.5;
+  lastBrickCollision = millis();
+}
+
+// Helper function to check if a line segment intersects with a rectangle
+bool lineRectIntersection(float x1, float y1, float x2, float y2, 
+                         int rx, int ry, int rw, int rh) {
+  // Check if either endpoint is inside rectangle
+  if ((x1 >= rx && x1 <= rx + rw && y1 >= ry && y1 <= ry + rh) ||
+      (x2 >= rx && x2 <= rx + rw && y2 >= ry && y2 <= ry + rh)) {
+    return true;
+  }
+  
+  // Check intersection with each edge of rectangle
+  if (lineLineIntersection(x1, y1, x2, y2, rx, ry, rx + rw, ry) ||           // Top edge
+      lineLineIntersection(x1, y1, x2, y2, rx + rw, ry, rx + rw, ry + rh) || // Right edge
+      lineLineIntersection(x1, y1, x2, y2, rx, ry + rh, rx + rw, ry + rh) || // Bottom edge
+      lineLineIntersection(x1, y1, x2, y2, rx, ry, rx, ry + rh)) {           // Left edge
+    return true;
+  }
+  return false;
+}
+
+// Helper function to check if two line segments intersect
+bool lineLineIntersection(float x1, float y1, float x2, float y2, 
+                         float x3, float y3, float x4, float y4) {
+  float denominator = ((y4 - y3) * (x2 - x1) - (x4 - x3) * (y2 - y1));
+  if (denominator == 0) return false; // Lines are parallel
+  
+  float ua = ((x4 - x3) * (y1 - y3) - (y4 - y3) * (x1 - x3)) / denominator;
+  float ub = ((x2 - x1) * (y1 - y3) - (y2 - y1) * (x1 - x3)) / denominator;
+  
+  return (ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1);
+}
+
+bool checkBallPaddleCollision() {
+  // Check if any corner of the ball hits the paddle
+  for (int cx = 0; cx <= 1; cx++) {
+    for (int cy = 0; cy <= 1; cy++) {
+      float testX = ballX + cx * BALL_SIZE;
+      float testY = ballY + cy * BALL_SIZE;
+      
+      if (testX >= paddleX && testX <= paddleX + 3 &&
+          testY >= paddleY && testY <= paddleY + PADDLE_HEIGHT) {
+        return true;
+      }
+    }
+  }
+  
+  // Also check the center point of ball edges for better collision
+  float midY = ballY + BALL_SIZE/2;
+  if (ballX >= paddleX && ballX <= paddleX + 3 &&
+      midY >= paddleY && midY <= paddleY + PADDLE_HEIGHT) {
+    return true;
+  }
+  
+  return false;
+}
+
+void loadHighScores() {
+  for (int i = 0; i < MAX_SCORES; i++) {
+    highScores[i] = (EEPROM.read(EEPROM_START_ADDR + i*2) << 8) | EEPROM.read(EEPROM_START_ADDR + i*2 + 1);
+  }
+}
+
+void saveHighScores() {
+  for (int i = 0; i < MAX_SCORES; i++) {
+    EEPROM.update(EEPROM_START_ADDR + i*2, highScores[i] >> 8);      // MSB
+    EEPROM.update(EEPROM_START_ADDR + i*2 + 1, highScores[i] & 0xFF); // LSB
+  }
+}
+
+void resetAllScores() {
+  // Reset all high scores to zero
+  for (int i = 0; i < MAX_SCORES; i++) {
+    highScores[i] = 0;
+  }
+  saveHighScores();
+  currentScoreIndex = -1;  // Reset current score index
+}
+
+void addScore(int newScore) {
+  // Find where this score fits
+  int existingScoreIndex = -1;
+  currentScoreIndex = -1;
+  
+  // Check if score already exists in leaderboard
+  for (int i = 0; i < MAX_SCORES; i++) {
+    if (highScores[i] == newScore) {
+      existingScoreIndex = i;
+      break;
+    }
+    if (newScore >= highScores[i]) {
+      currentScoreIndex = i;
+      break;
+    }
+  }
+  
+  // If the score already exists, just highlight it
+  if (existingScoreIndex != -1) {
+    currentScoreIndex = existingScoreIndex;
+  }
+  // If the score is new and makes it to the leaderboard
+  else if (currentScoreIndex != -1) {
+    // Shift scores down, skipping duplicates
+    int insertPos = currentScoreIndex;
+    int lastScore = newScore;
+    
+    for (int i = currentScoreIndex; i < MAX_SCORES; i++) {
+      int temp = highScores[i];
+      if (temp != lastScore || i == currentScoreIndex) {
+        // Keep track of last inserted score to skip duplicates
+        highScores[insertPos] = lastScore;
+        lastScore = temp;
+        insertPos++;
+        if (insertPos >= MAX_SCORES) break;
+      }
+    }
+    
+    // Only save if we modified the high scores
+    saveHighScores();
+  }
+}
+
+void displayLeaderboard() {
+  // Just call scrollLeaderboard which already handles this functionality
+  scrollLeaderboard();
+}
 
 void setup() {
   Serial.begin(9600);
   Wire.begin();
-  pinMode(ENCODER_SW_PIN, INPUT_PULLUP);  // Enable pullup for rotary encoder switch
-  pinMode(BUZZER_PIN, OUTPUT);           // Setup buzzer pin
+  pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  loadHighScores();
   
   if(!display.begin(SSD1306_SWITCHCAPVCC, SSD1306_I2C_ADDRESS))
-    Serial.println("SSD1306 allocation failed");
-  Serial.println("Display initialized!");
+    while(1); // Don't proceed if display failed
+  
 
   // Initialize bricks
   for(int i = 0; i < BRICK_COUNT; i++) {
@@ -68,21 +280,8 @@ void setup() {
   }
   display.setTextSize(1);
 
-  // Scan for I2C devices
-  byte error, address;
-  int devices = 0;
-  for(address = 1; address < 127; address++) {
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print("I2C device found at address 0x");
-      if (address < 16) Serial.print("0");
-      Serial.println(address, HEX);
-      devices++;
-    }
-  }
-  
-  if (devices == 0) Serial.println("No I2C devices found");
+  // I2C device scanning loop removed to improve startup time
+  // The display is already confirmed working at address 0x3C
 }
 
 void displayGameOver() {
@@ -104,6 +303,9 @@ void displayGameOver() {
     playWahWahSound();
     soundPlayed = true;
     gameOverStartTime = millis();  // Record when game over started
+    addScore(score);
+    inLeaderboard = true;
+    leaderboardStartTime = millis();
   }
 }
 
@@ -124,195 +326,70 @@ void playWahWahSound() {
   noTone(BUZZER_PIN);
   delay(500);
 }
-
-// Keep the old function in case you want to use it later
-void playMarioGameOverSound() {
-  // Mario game over melody
-  int melody[] = {
-    659, 659, 0, 659,  // E E   E
-    0, 523, 659, 0,    //   C E
-    784, 0, 392, 0,    // G   G  
-    523, 0, 392, 0,    // C   G
-    330, 0, 440, 0,    // E   A
-    494, 0, 440, 0,    // B   A
-    415, 0, 494, 0,    // Ab  B
-    392              // G
-  };
-  
-  int noteDurations[] = {100, 100, 75, 100, 75, 100, 100, 75, 100, 75, 100, 75, 100, 75, 100, 75, 
-                        100, 75, 100, 75, 100, 75, 100, 75, 100, 75, 100, 75, 200};
-  
-  for (int i = 0; i < 29; i++) {
-    if (melody[i] != 0) tone(BUZZER_PIN, melody[i], noteDurations[i]);
-    delay(noteDurations[i] + 20);  // Small gap between notes
-  }
-}
-
-void loop() {
-  if(gameOver) {
-    displayGameOver();
-    
-    // Check if 1 minute has passed in game over screen
-    if(millis() - gameOverStartTime > 6000) {  // 60000ms = 1 minute
-      display.clearDisplay();
-      display.display();
-      sleepMode();  // Enter sleep mode
-    }
-    // Check if button is pressed (LOW when pressed with pullup)
-    if(digitalRead(ENCODER_SW_PIN) == LOW) {
-      resetGame();  // Reset the game
-      delay(300);   // Simple debounce
-    }
-    
-    return;
-  }
-  // Read encoder
-  long newPosition = myEncoder.read() / encoderSensitivity;
-  if (newPosition != oldPosition) {
-    // Calculate movement with increased sensitivity
-    int moveAmount = (newPosition - oldPosition) * 1;  // Multiply by 3 for faster response
-    
-    paddleY += moveAmount;
-    oldPosition = newPosition;
-  }
-  
-  // Keep paddle on screen
-  paddleY = constrain(paddleY, 0, SCREEN_HEIGHT - PADDLE_HEIGHT);
-  
-  // Move ball
-  ballX += ballSpeedX;
-  ballY += ballSpeedY;
-  
-  // Wall collisions
-  if (ballY <= 0 || ballY >= SCREEN_HEIGHT - BALL_SIZE) {
-    ballSpeedY = -ballSpeedY;
-  } 
-  
-  // Paddle collision
-  if (ballX <= paddleX + 5 && ballY >= paddleY && ballY <= paddleY + PADDLE_HEIGHT &&
-      ballX >= paddleX - BALL_SIZE && millis() - lastPaddleCollision > 50) {
-    
-    // Calculate which part of the paddle was hit
-    float hitPoint = (ballY - paddleY) / PADDLE_HEIGHT;
-    
-    // Side collision detection
-    if (ballY <= paddleY + 2 || ballY >= paddleY + PADDLE_HEIGHT - 2) {
-      // Hit top or bottom edge of paddle
-      ballSpeedY = (hitPoint - 0.5) * 3; // Stronger angle effect
-      ballSpeedX = abs(ballSpeedX); // Go right
-    } 
-    else {
-      // Hit front face of paddle
-      ballSpeedX = abs(ballSpeedX); // Always bounce rightward
-      ballSpeedY = (hitPoint - 0.5) * 2; // Normal angle effect
-    }
-    
-    score++;
-    lastPaddleCollision = millis();
-    ballX = paddleX + 6; // Prevent sticking to paddle
-    
-    // Paddle hit sound
-    tone(BUZZER_PIN, 660, 50);
-  }
-  
-  // Game over if ball passes left edge
-  // Or if ball gets behind paddle on left side
-  if (ballX < 0 || 
-     (ballX < paddleX && (ballY < paddleY || ballY > paddleY + PADDLE_HEIGHT))) {
-    gameOver = true;
-    displayGameOver();
-    return;  // Exit loop to prevent further game state changes
-  }
-  
-  // Right wall bounce
-  if (ballX > SCREEN_WIDTH - BALL_SIZE) {
-    ballSpeedX = -ballSpeedX;
-  }
-  
-  // Move and check brick collisions
-  for(int i = 0; i < BRICK_COUNT; i++) {
-    if(brickActive[i]) {
-      // Move brick left at intervals
-      unsigned long currentTime = millis();
-      if(currentTime - lastMoveTime > MOVE_INTERVAL) {
-        brickX[i] -= BRICK_FALL_SPEED;
-        if(i == BRICK_COUNT - 1) lastMoveTime = currentTime;
-      }
-     
-      // Check if brick hits bottom
-      if(brickX[i] <= 0) {
-        gameOver = true;
-        displayGameOver();
-        return;  // Exit loop to prevent further game state changes
-      }
-     
-     // Ball collision with brick
-      if(ballX + BALL_SIZE >= brickX[i] && 
-         ballX <= brickX[i] + BRICK_WIDTH && 
-         ballY + BALL_SIZE >= brickY[i] && 
-         ballY <= brickY[i] + BRICK_HEIGHT) {
-        
-        // Determine which side of the brick was hit
-        // Use the previous position to determine collision direction
-        float prevBallX = ballX - ballSpeedX;
-        float prevBallY = ballY - ballSpeedY;
-        
-        // Horizontal collision
-        if ((prevBallX + BALL_SIZE <= brickX[i] || prevBallX >= brickX[i] + BRICK_WIDTH) &&
-            ballY + BALL_SIZE > brickY[i] && ballY < brickY[i] + BRICK_HEIGHT) {
-          ballSpeedX = -ballSpeedX;  // Reverse horizontal direction
-        } else {
-          ballSpeedY = -ballSpeedY;  // Reverse vertical direction
-        }
-        
-        brickActive[i] = false;
-        score += 5;  // Bonus points for breaking brick
-
-        // Brick hit sound - higher pitch than paddle
-        tone(BUZZER_PIN, 880, 50);
-        
-        // Create new brick at top
-        brickX[i] = SCREEN_WIDTH + 10;  // Respawn at right edge
-        brickY[i] = random(5, SCREEN_HEIGHT-BRICK_HEIGHT-5);
-        brickActive[i] = true;
-      }
-    }
-  }
-  
-  // Draw everything
+void sleepMode() {
+  // Display sleep message
   display.clearDisplay();
+  display.setCursor(15, 10); 
+  display.println("POWER SAVING");
+  display.setCursor(20, 20);
+  display.println("Press button");
+  display.display();
+  delay(100);
+
+  // Turn off display to save power
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  noTone(BUZZER_PIN); 
+
+  // Configure interrupt for button press wakeup
+  attachInterrupt(digitalPinToInterrupt(2), wakeUp, FALLING);
+
+  // Put MCU to sleep
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); 
+  sleep_enable();
+  sleep_mode();
   
-  // Draw brick if active
-  for(int i = 0; i < BRICK_COUNT; i++) {
-    if(brickActive[i]) {
-      display.fillRect(brickX[i], brickY[i], BRICK_WIDTH, BRICK_HEIGHT, SSD1306_WHITE);
-    }
+  // Code resumes here after wake
+  sleep_disable();
+  detachInterrupt(digitalPinToInterrupt(2));
+  
+  // Turn display back on
+  display.begin(SSD1306_SWITCHCAPVCC, SSD1306_I2C_ADDRESS);
+  display.ssd1306_command(SSD1306_DISPLAYON);
+
+  // Display wake up message
+  display.clearDisplay();
+  display.display();
+  // Debounce button
+  delay(50);
+  while(digitalRead(ENCODER_SW_PIN) == LOW) {
+    delay(10);
   }
   
-  // Draw paddle
-  display.fillRect(paddleX, paddleY, 3, PADDLE_HEIGHT, SSD1306_WHITE);
-  
-  // Draw ball
-  display.fillRect(ballX, ballY, BALL_SIZE, BALL_SIZE, SSD1306_WHITE);
-  
-  // Draw score
-  display.setRotation(1);  // Rotate 90 degrees clockwise
-  // Score display gameplay screen
-  display.setRotation(0);  // Reset rotation to default
-  
-  display.display();
+  resetGame(); // Reset game when waking up
 }
 
-// Add this new function to reset the game
+// Wake up interrupt handler
+void wakeUp() {
+  // This function needs to exist but be empty
+}
+
+
+
 void resetGame() {
+  // Reset game state
+  score = 0;
+  paddleY = (SCREEN_HEIGHT - PADDLE_HEIGHT) / 2;
   ballX = SCREEN_WIDTH / 2;
   ballY = SCREEN_HEIGHT / 2;
   ballSpeedX = 0.6;
-  lastPaddleCollision = 0;
   ballSpeedY = 0.5;
-  score = 0;
-  soundPlayed = false;  // Reset sound flag for next game over
   gameOver = false;
+  soundPlayed = false;
+  lastPaddleCollision = 0;
+  inLeaderboard = false;
+  currentScoreIndex = -1;
+  scrollOffset = 0;
+  lastMoveTime = millis();
   
   // Reset bricks
   for(int i = 0; i < BRICK_COUNT; i++) {
@@ -322,11 +399,252 @@ void resetGame() {
   }
 }
 
-void sleepMode() {
-  // Turn off display and enter low power mode
+void scrollLeaderboard() {
+  static long lastScrollPosition = -999;
+  
+  // Read encoder for scrolling
+  // Handle score flashing
+  if (millis() - lastFlashUpdate > 300) { // Flash every 300ms
+    flashState = !flashState;
+    lastFlashUpdate = millis();  
+  }
+  
+  long scrollPosition = myEncoder.read()/2;  // Reduce sensitivity
+  if (scrollPosition != lastScrollPosition) {
+    // Calculate scroll direction
+    int scrollChange = scrollPosition - lastScrollPosition;
+    lastScrollPosition = scrollPosition;  
+    scrollOffset -= scrollChange;
+    scrollOffset = constrain(scrollOffset, 0, MAX_SCORES*8);  // Allow scrolling through all 50 scores
+    
+    // Display scores with offset
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(15, 0 - scrollOffset);
+    display.println("HIGH SCORES");  
+  }
+  
+  // Always update display for flashing effect
   display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(15, 0);
+  display.println("HIGH SCORES");
+  
+  for (int i = 0; i < MAX_SCORES; i++) {
+    int yPos = 10 + i*8 - scrollOffset;
+    if (yPos < 0 || yPos > SCREEN_HEIGHT) continue;
+    
+    display.setCursor(5, yPos);
+    display.print(i + 1); 
+    display.print(". ");
+    if (i == currentScoreIndex && flashState) {  // Flash current score
+      display.fillRect(20, yPos-1, 30, 9, SSD1306_INVERSE); // Highlight background
+    }
+    display.print(highScores[i]);
+  }
+    
+    display.display();
+  }
+void loop() {
+   // Handle game states
+   if (gameOver) {
+     if (!inLeaderboard) {
+      displayGameOver();
+      
+      // Check for button press to restart game
+      if (digitalRead(ENCODER_SW_PIN) == LOW) {
+        delay(50);  // Debounce
+        // Go directly to leaderboard screen
+        inLeaderboard = true;
+        leaderboardStartTime = millis();
+      }
+    } 
+    else { // In leaderboard mode
+      // Check for long button press to reset scores
+      if (digitalRead(ENCODER_SW_PIN) == LOW) {
+        if (buttonPressStartTime == 0) {
+          buttonPressStartTime = millis();
+        } else if (millis() - buttonPressStartTime > RESET_SCORES_TIME) {
+          // Display reset message
+          display.clearDisplay();
+          display.setCursor(10, 10);
+          display.println("Resetting scores...");
+          display.display();
+          resetAllScores();
+          delay(1000);  // Show message briefly
+          buttonPressStartTime = 0;
+        }
+      } else {
+        buttonPressStartTime = 0;
+      }
+      displayLeaderboard();
+      // Check for button press to restart game - ONLY when button pressed
+      if (digitalRead(ENCODER_SW_PIN) == LOW) {
+        delay(50);  // Debounce
+        resetGame();
+        inLeaderboard = false;
+      }
+      
+      // Use encoder for scrolling
+      scrollLeaderboard();
+      
+      // Auto transition to sleep mode after 6 seconds of leaderboard
+      // Changed from 6 to 80 seconds
+      if (millis() - leaderboardStartTime > 80000) {
+         display.clearDisplay();
+         display.setCursor(10, 10);
+         display.println("Sleep in 3 seconds...");
+         display.display();
+         delay(3000);
+         sleepMode();
+      }
+    }
+   }
+   else {
+    // Read encoder for paddle position
+long newPosition = myEncoder.read() / 2;
+if (newPosition != oldEncPosition) {
+  int encChange = newPosition - oldEncPosition;
+  oldEncPosition = newPosition;
+
+  // Apply acceleration based on rotation speed
+  int moveAmount = ENCODER_MIN_STEP;
+  if (abs(encChange) > 1) {
+    moveAmount = min(ENCODER_MAX_STEP, ENCODER_MIN_STEP + 
+                    abs(encChange) * ENCODER_ACCELERATION);
+  }
+  
+  paddleY += (encChange > 0) ? moveAmount : -moveAmount;
+  paddleY = constrain(paddleY, 0, SCREEN_HEIGHT - PADDLE_HEIGHT);
+}
+
+    // Check button state for ball control
+    bool buttonPressed = (digitalRead(ENCODER_SW_PIN) == LOW);
+    
+    // If ball is stuck to paddle, update its position with paddle
+    if (ballStuck) {
+      ballY = paddleY + ballPaddleOffset;
+      ballX = paddleX + 3;  // Position right next to paddle
+      
+      // Release ball when button released
+      if (!buttonPressed) {
+        ballStuck = false;
+        ballSpeedX = abs(ballSpeedX);  // Make ball move right
+        tone(BUZZER_PIN, NOTE_DS5, 50);
+      }
+    }
+    
+    // Update ball position
+    if (!ballStuck) {
+      ballX += ballSpeedX;
+      ballY += ballSpeedY;
+    }
+  
+  // Ball collision with walls
+  if (ballY <= 0 || ballY >= SCREEN_HEIGHT - BALL_SIZE) {
+    ballSpeedY *= -1;
+    tone(BUZZER_PIN, NOTE_C5, 10);
+  }
+  
+  // Ball collision with right wall
+  if (ballX >= SCREEN_WIDTH - BALL_SIZE) {
+    ballSpeedX *= -1;
+    tone(BUZZER_PIN, NOTE_C5, 10);
+  }
+  
+  // Ball collision with paddle
+if (ballSpeedX < 0 && checkBallPaddleCollision()) {
+  // Check if button is pressed during collision to stick ball
+  if (digitalRead(ENCODER_SW_PIN) == LOW) {
+    ballStuck = true;
+    ballPaddleOffset = ballY - paddleY;
+    return;
+  }
+
+  // Note: Calculation moved below
+  
+    
+    // Check if button is pressed during collision to stick ball
+    if (digitalRead(ENCODER_SW_PIN) == LOW) {
+      ballStuck = true;
+      ballPaddleOffset = ballY - paddleY;  // Remember offset from top of paddle
+      return;  // Skip rest of processing
+    }
+    
+    // Ball position correction to prevent sticking
+    ballX = paddleX + 3;
+    
+    // Calculate bounce angle based on where ball hits paddle
+  float relativeIntersectY = (paddleY + (PADDLE_HEIGHT / 2)) - (ballY + (BALL_SIZE / 2));
+  float normalizedIntersectY = relativeIntersectY / (PADDLE_HEIGHT / 2);
+  float bounceAngle = normalizedIntersectY * 0.75;
+  
+  ballSpeedX = abs(ballSpeedX);
+  ballSpeedY = -sin(bounceAngle) * 2.0;
+  score++;
+  tone(BUZZER_PIN, NOTE_DS5, 50);
+}
   display.display();
-  // Wait for button press to wake up
-  while(digitalRead(ENCODER_SW_PIN) != LOW);
-  resetGame();  // Reset game when waking up
+  
+  // Handle game over condition
+  if (ballX < 0) {
+    gameOver = true;
+    return;
+  }
+  
+  // Update and check brick collisions
+  unsigned long currentTime = millis();
+  if (currentTime - lastMoveTime > MOVE_INTERVAL) {
+    for (int i = 0; i < BRICK_COUNT; i++) {
+      if (brickActive[i]) {
+        brickX[i]--;
+        
+        // Check if brick has reached left edge (game over)
+        if (brickX[i] <= 0) {
+          gameOver = true;
+        }
+        if (currentTime - lastBrickCollision > 100) { // Prevent multiple collisions
+          // ... rest of your brick respawn code
+          lastBrickCollision = currentTime;
+        }
+
+        // Check collision with ball
+        if (checkBrickCollision(ballX, ballY, BALL_SIZE, brickX[i], brickY[i], BRICK_WIDTH, BRICK_HEIGHT)) {
+  // Handle physics
+  handleBrickCollision(ballX, ballY, ballSpeedX, ballSpeedY, 
+                      brickX[i], brickY[i], BRICK_WIDTH, BRICK_HEIGHT, BALL_SIZE);
+  
+  // Handle brick destruction and scoring
+  brickActive[i] = false;
+  score += 5;
+  tone(BUZZER_PIN, NOTE_D5, 100);
+  
+  // Respawn brick
+  brickX[i] = SCREEN_WIDTH + random(10, 50);
+  brickY[i] = random(5, SCREEN_HEIGHT - BRICK_HEIGHT - 5);
+  brickActive[i] = true;
+}
+      }
+    }
+    lastMoveTime = currentTime;
+  }
+  
+  // Draw everything
+  display.clearDisplay();
+  
+  // Draw paddle
+  display.fillRoundRect(paddleX, paddleY, 3, PADDLE_HEIGHT, 1, SSD1306_WHITE);
+  
+  // Draw ball
+  display.fillRect(ballX, ballY, BALL_SIZE, BALL_SIZE, SSD1306_WHITE);
+  
+  // Draw bricks
+  for (int i = 0; i < BRICK_COUNT; i++) {
+    if (brickActive[i]) {
+      display.fillRect(brickX[i], brickY[i], BRICK_WIDTH, BRICK_HEIGHT, SSD1306_WHITE);
+    }
+  }
+  
+  display.display();
+}
 }
