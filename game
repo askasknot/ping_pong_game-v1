@@ -1,0 +1,332 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Encoder.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1  // Reset pin # (or -1 if sharing Arduino reset pin)
+#define PADDLE_HEIGHT 8
+#define SSD1306_I2C_ADDRESS 0x3C  // Common I2C address for SSD1306 displays
+#define BALL_SIZE 3
+#define BRICK_WIDTH 4
+#define BRICK_HEIGHT 4
+#define BRICK_COUNT 5
+#define BRICK_FALL_SPEED 1
+#define GAME_OVER_Y 30
+#define MOVE_INTERVAL 300  // Milliseconds between brick movements
+#define BRICK_RESPAWN_X -5  // Position left of screen
+#define BUZZER_PIN 5       // Pin for piezo buzzer
+#define ENCODER_SW_PIN 4
+
+// Define musical notes
+#define NOTE_C5  523
+#define NOTE_CS5 554
+#define NOTE_D5  587
+#define NOTE_DS5 622
+
+// Define display object
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Encoder myEncoder(2, 3); // Using pins 2 and 3 for encoder
+
+// Game variables
+int encoderSensitivity = 1;  // Adjust sensitivity (higher value = less sensitive)
+int paddleY = (SCREEN_HEIGHT - PADDLE_HEIGHT) / 2;
+int paddleX = 10;  // Moved 10 pixels to the right
+float ballX = SCREEN_WIDTH / 2;
+float ballY = SCREEN_HEIGHT / 2;
+float ballSpeedX = 0.6;
+unsigned long lastPaddleCollision = 0;
+float ballSpeedY = 0.5;
+int score = 0;
+unsigned long gameOverStartTime = 0;  // Track when game over started
+
+// Multiple bricks
+int brickX[BRICK_COUNT];  
+float brickY[BRICK_COUNT];
+bool brickActive[BRICK_COUNT];
+unsigned long lastMoveTime = 0;
+bool soundPlayed = false;
+bool gameOver = false;
+long oldPosition = -999;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  pinMode(ENCODER_SW_PIN, INPUT_PULLUP);  // Enable pullup for rotary encoder switch
+  pinMode(BUZZER_PIN, OUTPUT);           // Setup buzzer pin
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SSD1306_I2C_ADDRESS))
+    Serial.println("SSD1306 allocation failed");
+  Serial.println("Display initialized!");
+
+  // Initialize bricks
+  for(int i = 0; i < BRICK_COUNT; i++) {
+    brickX[i] = random(SCREEN_WIDTH + 10, SCREEN_WIDTH + 50);  // Start right of screen
+    brickY[i] = random(5, SCREEN_HEIGHT - BRICK_HEIGHT - 5);
+    brickActive[i] = true;
+  }
+  display.setTextSize(1);
+
+  // Scan for I2C devices
+  byte error, address;
+  int devices = 0;
+  for(address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      devices++;
+    }
+  }
+  
+  if (devices == 0) Serial.println("No I2C devices found");
+}
+
+void displayGameOver() {
+  display.clearDisplay(); 
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  
+  // Draw "GAME OVER" text
+  display.setCursor(25, 10);
+  display.println("GAME OVER");
+  display.setCursor(20, 20);
+  display.print("Score: ");
+  display.print(score);
+  
+  display.display();
+  
+  // Play sound only once
+  if (!soundPlayed) {
+    playWahWahSound();
+    soundPlayed = true;
+    gameOverStartTime = millis();  // Record when game over started
+  }
+}
+
+void playWahWahSound() {
+  // Play a Wah-Wah-Wah-Wah sound
+  tone(BUZZER_PIN, NOTE_DS5);
+  delay(300);
+  tone(BUZZER_PIN, NOTE_D5);
+  delay(300);
+  tone(BUZZER_PIN, NOTE_CS5);
+  delay(300);
+  for (byte i = 0; i < 10; i++) {
+    for (int pitch = -10; pitch <= 10; pitch++) {
+      tone(BUZZER_PIN, NOTE_C5 + pitch);
+      delay(5);
+    }
+  }
+  noTone(BUZZER_PIN);
+  delay(500);
+}
+
+// Keep the old function in case you want to use it later
+void playMarioGameOverSound() {
+  // Mario game over melody
+  int melody[] = {
+    659, 659, 0, 659,  // E E   E
+    0, 523, 659, 0,    //   C E
+    784, 0, 392, 0,    // G   G  
+    523, 0, 392, 0,    // C   G
+    330, 0, 440, 0,    // E   A
+    494, 0, 440, 0,    // B   A
+    415, 0, 494, 0,    // Ab  B
+    392              // G
+  };
+  
+  int noteDurations[] = {100, 100, 75, 100, 75, 100, 100, 75, 100, 75, 100, 75, 100, 75, 100, 75, 
+                        100, 75, 100, 75, 100, 75, 100, 75, 100, 75, 100, 75, 200};
+  
+  for (int i = 0; i < 29; i++) {
+    if (melody[i] != 0) tone(BUZZER_PIN, melody[i], noteDurations[i]);
+    delay(noteDurations[i] + 20);  // Small gap between notes
+  }
+}
+
+void loop() {
+  if(gameOver) {
+    displayGameOver();
+    
+    // Check if 1 minute has passed in game over screen
+    if(millis() - gameOverStartTime > 6000) {  // 60000ms = 1 minute
+      display.clearDisplay();
+      display.display();
+      sleepMode();  // Enter sleep mode
+    }
+    // Check if button is pressed (LOW when pressed with pullup)
+    if(digitalRead(ENCODER_SW_PIN) == LOW) {
+      resetGame();  // Reset the game
+      delay(300);   // Simple debounce
+    }
+    
+    return;
+  }
+  // Read encoder
+  long newPosition = myEncoder.read() / encoderSensitivity;
+  if (newPosition != oldPosition) {
+    // Calculate movement with increased sensitivity
+    int moveAmount = (newPosition - oldPosition) * 1;  // Multiply by 3 for faster response
+    
+    paddleY += moveAmount;
+    oldPosition = newPosition;
+  }
+  
+  // Keep paddle on screen
+  paddleY = constrain(paddleY, 0, SCREEN_HEIGHT - PADDLE_HEIGHT);
+  
+  // Move ball
+  ballX += ballSpeedX;
+  ballY += ballSpeedY;
+  
+  // Wall collisions
+  if (ballY <= 0 || ballY >= SCREEN_HEIGHT - BALL_SIZE) {
+    ballSpeedY = -ballSpeedY;
+  } 
+  
+  // Paddle collision
+  if (ballX <= paddleX + 5 && ballY >= paddleY && ballY <= paddleY + PADDLE_HEIGHT &&
+      ballX >= paddleX - BALL_SIZE && millis() - lastPaddleCollision > 50) {
+    
+    // Calculate which part of the paddle was hit
+    float hitPoint = (ballY - paddleY) / PADDLE_HEIGHT;
+    
+    // Side collision detection
+    if (ballY <= paddleY + 2 || ballY >= paddleY + PADDLE_HEIGHT - 2) {
+      // Hit top or bottom edge of paddle
+      ballSpeedY = (hitPoint - 0.5) * 3; // Stronger angle effect
+      ballSpeedX = abs(ballSpeedX); // Go right
+    } 
+    else {
+      // Hit front face of paddle
+      ballSpeedX = abs(ballSpeedX); // Always bounce rightward
+      ballSpeedY = (hitPoint - 0.5) * 2; // Normal angle effect
+    }
+    
+    score++;
+    lastPaddleCollision = millis();
+    ballX = paddleX + 6; // Prevent sticking to paddle
+    
+    // Paddle hit sound
+    tone(BUZZER_PIN, 660, 50);
+  }
+  
+  // Game over if ball passes left edge
+  // Or if ball gets behind paddle on left side
+  if (ballX < 0 || 
+     (ballX < paddleX && (ballY < paddleY || ballY > paddleY + PADDLE_HEIGHT))) {
+    gameOver = true;
+    displayGameOver();
+    return;  // Exit loop to prevent further game state changes
+  }
+  
+  // Right wall bounce
+  if (ballX > SCREEN_WIDTH - BALL_SIZE) {
+    ballSpeedX = -ballSpeedX;
+  }
+  
+  // Move and check brick collisions
+  for(int i = 0; i < BRICK_COUNT; i++) {
+    if(brickActive[i]) {
+      // Move brick left at intervals
+      unsigned long currentTime = millis();
+      if(currentTime - lastMoveTime > MOVE_INTERVAL) {
+        brickX[i] -= BRICK_FALL_SPEED;
+        if(i == BRICK_COUNT - 1) lastMoveTime = currentTime;
+      }
+     
+      // Check if brick hits bottom
+      if(brickX[i] <= 0) {
+        gameOver = true;
+        displayGameOver();
+        return;  // Exit loop to prevent further game state changes
+      }
+     
+     // Ball collision with brick
+      if(ballX + BALL_SIZE >= brickX[i] && 
+         ballX <= brickX[i] + BRICK_WIDTH && 
+         ballY + BALL_SIZE >= brickY[i] && 
+         ballY <= brickY[i] + BRICK_HEIGHT) {
+        
+        // Determine which side of the brick was hit
+        // Use the previous position to determine collision direction
+        float prevBallX = ballX - ballSpeedX;
+        float prevBallY = ballY - ballSpeedY;
+        
+        // Horizontal collision
+        if ((prevBallX + BALL_SIZE <= brickX[i] || prevBallX >= brickX[i] + BRICK_WIDTH) &&
+            ballY + BALL_SIZE > brickY[i] && ballY < brickY[i] + BRICK_HEIGHT) {
+          ballSpeedX = -ballSpeedX;  // Reverse horizontal direction
+        } else {
+          ballSpeedY = -ballSpeedY;  // Reverse vertical direction
+        }
+        
+        brickActive[i] = false;
+        score += 5;  // Bonus points for breaking brick
+
+        // Brick hit sound - higher pitch than paddle
+        tone(BUZZER_PIN, 880, 50);
+        
+        // Create new brick at top
+        brickX[i] = SCREEN_WIDTH + 10;  // Respawn at right edge
+        brickY[i] = random(5, SCREEN_HEIGHT-BRICK_HEIGHT-5);
+        brickActive[i] = true;
+      }
+    }
+  }
+  
+  // Draw everything
+  display.clearDisplay();
+  
+  // Draw brick if active
+  for(int i = 0; i < BRICK_COUNT; i++) {
+    if(brickActive[i]) {
+      display.fillRect(brickX[i], brickY[i], BRICK_WIDTH, BRICK_HEIGHT, SSD1306_WHITE);
+    }
+  }
+  
+  // Draw paddle
+  display.fillRect(paddleX, paddleY, 3, PADDLE_HEIGHT, SSD1306_WHITE);
+  
+  // Draw ball
+  display.fillRect(ballX, ballY, BALL_SIZE, BALL_SIZE, SSD1306_WHITE);
+  
+  // Draw score
+  display.setRotation(1);  // Rotate 90 degrees clockwise
+  // Score display gameplay screen
+  display.setRotation(0);  // Reset rotation to default
+  
+  display.display();
+}
+
+// Add this new function to reset the game
+void resetGame() {
+  ballX = SCREEN_WIDTH / 2;
+  ballY = SCREEN_HEIGHT / 2;
+  ballSpeedX = 0.6;
+  lastPaddleCollision = 0;
+  ballSpeedY = 0.5;
+  score = 0;
+  soundPlayed = false;  // Reset sound flag for next game over
+  gameOver = false;
+  
+  // Reset bricks
+  for(int i = 0; i < BRICK_COUNT; i++) {
+    brickX[i] = random(SCREEN_WIDTH + 10, SCREEN_WIDTH + 50);
+    brickY[i] = random(5, SCREEN_HEIGHT - BRICK_HEIGHT - 5);
+    brickActive[i] = true;
+  }
+}
+
+void sleepMode() {
+  // Turn off display and enter low power mode
+  display.clearDisplay();
+  display.display();
+  // Wait for button press to wake up
+  while(digitalRead(ENCODER_SW_PIN) != LOW);
+  resetGame();  // Reset game when waking up
+}
